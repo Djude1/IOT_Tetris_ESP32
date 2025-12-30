@@ -1,16 +1,3 @@
-/*
-  ESP32 俄羅斯方塊遊戲（BLE 控制 + MQTT 只上傳最終成績）
-  - BLE:
-    - CMD  (WRITE): left/right/down/rotate/superdown/pause/reset/start
-    - NAME (WRITE): 玩家姓名 (1~20字)
-    - STATUS (NOTIFY/READ): 狀態訊息回傳給 App
-  - MQTT:
-    - Publish only: Tetris/Score  (retain=true)
-  - OLED:
-    - OLED1 (0x3C): 動畫（start/happy/waiting/sad）
-    - OLED2 (0x3D): 分數/玩家顯示（若你第二塊 OLED 位址不同請改 OLED2_ADDR）
-*/
-
 #define MQTT_MAX_PACKET_SIZE 512
 
 #include <MD_MAX72xx.h>
@@ -20,58 +7,47 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// BLE
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
 
-// 包含動畫數據
 #include "start.h"
 #include "happy.h"
 #include "waiting.h"
 #include "sad.h"
+#include "welcome.h"
 
-// ==================== OLED 設定 ====================
 #define SDA_PIN 21
 #define SCL_PIN 22
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 
-// OLED1：動畫（通常 0x3C）
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// OLED2：分數顯示（通常 0x3D）
-#define OLED2_ADDR 0x3D
-Adafruit_SSD1306 display2(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-bool oled2_ok = false;
-
-// ==================== 動畫狀態枚舉 ====================
 enum AnimationState {
-  ANIM_START,    // 開始畫面（循環）
-  ANIM_PLAYING,  // 遊戲進行中（不播動畫）
-  ANIM_HAPPY,    // 消除方塊（單次）
-  ANIM_WAITING,  // 暫停（循環）
-  ANIM_SAD       // 遊戲結束（單次）
+  ANIM_START,
+  ANIM_PLAYING,
+  ANIM_HAPPY,
+  ANIM_WAITING,
+  ANIM_SAD,
+  ANIM_WELCOME
 };
 
-// 動畫控制變數
 AnimationState currentAnimState = ANIM_START;
 AnimationState targetAnimState = ANIM_START;
 uint8_t currentFrame = 0;
 unsigned long lastFrameTime = 0;
 const AnimatedGIF* currentGIF = nullptr;
 bool animationChanged = false;
-bool playOnce = false;               // 是否只播放一次
-bool animationFinished = false;      // 動畫是否播放完成
-AnimationState returnState = ANIM_PLAYING;  // 單次動畫播完後回到的狀態
+bool playOnce = false;
+bool animationFinished = false;
+AnimationState returnState = ANIM_PLAYING;
 
-// ==================== WiFi 設定 ====================
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+const char* ssid = "AAA666";
+const char* password = "0978926291";
 
-// ==================== MQTT 設定（只上傳 Score） ====================
 const char* mqtt_server = "MQTTGO.io";
 const int mqtt_port = 1883;
 const char* mqtt_client_id = "MQTTGO-9345814340";
@@ -80,12 +56,10 @@ const char* mqtt_topic_score = "Tetris/Score";
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// ==================== BLE (App 控制/姓名/狀態) ====================
-// 自訂 UUID（App 端請用同一組）
 #define BLE_SERVICE_UUID        "b1d2f000-7c1a-4b4a-9b2f-111111111111"
-#define BLE_CHAR_CMD_UUID       "b1d2f001-7c1a-4b4a-9b2f-111111111111"  // App -> ESP32 寫入指令
-#define BLE_CHAR_NAME_UUID      "b1d2f002-7c1a-4b4a-9b2f-111111111111"  // App -> ESP32 寫入姓名
-#define BLE_CHAR_STATUS_UUID    "b1d2f003-7c1a-4b4a-9b2f-111111111111"  // ESP32 -> App notify 狀態
+#define BLE_CHAR_CMD_UUID       "b1d2f001-7c1a-4b4a-9b2f-111111111111"
+#define BLE_CHAR_NAME_UUID      "b1d2f002-7c1a-4b4a-9b2f-111111111111"
+#define BLE_CHAR_STATUS_UUID    "b1d2f003-7c1a-4b4a-9b2f-111111111111"
 
 BLEServer* pServer = nullptr;
 BLECharacteristic* pCharCmd = nullptr;
@@ -93,40 +67,37 @@ BLECharacteristic* pCharName = nullptr;
 BLECharacteristic* pCharStatus = nullptr;
 bool bleConnected = false;
 
-// ==================== MAX7219 硬體設定 ====================
 #define HARDWARE_TYPE MD_MAX72XX::FC16_HW
 #define CS_PIN 5
 #define NUM_MODULES 4
 MD_MAX72XX mx = MD_MAX72XX(HARDWARE_TYPE, CS_PIN, NUM_MODULES);
 
-// ==================== 遊戲狀態 ====================
 bool gamePaused = false;
 bool gameOver = false;
 bool gameStarted = false;
 int gameScore = 0;
 String playerName = "Player";
 
-// 顯示尺寸
+unsigned long lastScoreUpdate = 0;
+const unsigned long SCORE_UPDATE_INTERVAL = 1000;
+
 const int SCREEN_W = 8;
 const int SCREEN_H = SCREEN_W * NUM_MODULES;
 
-// 遊戲場地緩衝區
 uint8_t field[SCREEN_H];
-
-// 時間控制
 unsigned long lastDrop = 0;
 unsigned long dropInterval = 500;
 const unsigned long refreshInterval = 33;
 unsigned long lastRefresh = 0;
 
-// 前一幀緩衝區
 uint8_t prevBuf[NUM_MODULES][SCREEN_W];
 
-// 指令緩衝（沿用你原本 newCommand / mqttCommand 的流程）
 String mqttCommand = "";
 bool newCommand = false;
 
-// ==================== 當前方塊結構 ====================
+unsigned long lastWifiCheck = 0;
+const unsigned long wifiCheckInterval = 30000;
+
 struct Block {
   const int (*shape)[2];
   int len;
@@ -135,7 +106,6 @@ struct Block {
   char type;
 } current;
 
-// ==================== 七種俄羅斯方塊形狀定義 ====================
 const int I_SHAPE[2][4][2] = {
   { { 0, 0 }, { 0, 1 }, { 0, 2 }, { 0, 3 } },
   { { -1, 1 }, { 0, 1 }, { 1, 1 }, { 2, 1 } }
@@ -170,7 +140,6 @@ const int Z_SHAPE[2][4][2] = {
   { { 2, 0 }, { 1, 1 }, { 2, 1 }, { 1, 2 } }
 };
 
-// ==================== Game Over 字母點陣圖 ====================
 static const uint8_t PAT_G[8] = { 0x3C, 0x42, 0x40, 0x4E, 0x42, 0x42, 0x3C, 0x00 };
 static const uint8_t PAT_A[8] = { 0x18, 0x24, 0x42, 0x7E, 0x42, 0x42, 0x42, 0x00 };
 static const uint8_t PAT_M[8] = { 0x42, 0x66, 0x5A, 0x5A, 0x42, 0x42, 0x42, 0x00 };
@@ -180,11 +149,35 @@ static const uint8_t PAT_V[8] = { 0x42, 0x42, 0x42, 0x42, 0x42, 0x24, 0x18, 0x00
 static const uint8_t PAT_R[8] = { 0x7C, 0x42, 0x42, 0x7C, 0x48, 0x44, 0x42, 0x00 };
 static const uint8_t PAT_P[8] = { 0x7C, 0x42, 0x42, 0x7C, 0x40, 0x40, 0x40, 0x00 };
 
-// ==================== BLE 輔助 ====================
+void printMemoryInfo() {
+  Serial.println("[Memory] ========================================");
+  Serial.print("[Memory] Free heap: ");
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(" bytes");
+  Serial.print("[Memory] Largest free block: ");
+  Serial.print(ESP.getMaxAllocHeap());
+  Serial.println(" bytes");
+  Serial.print("[Memory] Min free heap: ");
+  Serial.print(ESP.getMinFreeHeap());
+  Serial.println(" bytes");
+  Serial.println("[Memory] ========================================");
+}
+
 void bleSendStatus(const String& s) {
   if (!bleConnected || pCharStatus == nullptr) return;
-  pCharStatus->setValue(s.c_str());
+  pCharStatus->setValue(s);
   pCharStatus->notify();
+}
+
+void sendScoreToBLE() {
+  if (!bleConnected || pCharStatus == nullptr) return;
+
+  String scoreMsg = "SCORE:" + String(gameScore);
+  pCharStatus->setValue(scoreMsg);
+  pCharStatus->notify();
+
+  Serial.print("[BLE] 📊 已發送分數: ");
+  Serial.println(gameScore);
 }
 
 class MyServerCallbacks : public BLEServerCallbacks {
@@ -192,47 +185,48 @@ class MyServerCallbacks : public BLEServerCallbacks {
     (void)pServer;
     bleConnected = true;
     bleSendStatus("BLE 已連線");
+    Serial.println("[BLE] ✓ 裝置已連線");
   }
   void onDisconnect(BLEServer* pServer) override {
     bleConnected = false;
-    pServer->startAdvertising(); // 斷線後重新廣播
+    Serial.println("[BLE] ✗ 裝置已斷線，重新開始廣播");
+    pServer->startAdvertising();
   }
 };
 
 class CmdCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) override {
-    std::string v = pCharacteristic->getValue();
-    if (v.empty()) return;
+    String v = pCharacteristic->getValue();
+    if (v.length() == 0) return;
 
-    String cmd = String(v.c_str());
+    String cmd = v;
     cmd.trim();
     cmd.toLowerCase();
 
-    mqttCommand = cmd;   // 沿用原本 loop() 指令處理
+    mqttCommand = cmd;
     newCommand = true;
   }
 };
 
 class NameCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) override {
-    std::string v = pCharacteristic->getValue();
-    if (v.empty()) return;
+    String v = pCharacteristic->getValue();
+    if (v.length() == 0) return;
 
-    String name = String(v.c_str());
+    String name = v;
     name.trim();
 
-    if (name.length() >= 1 && name.length() <= 20) {
+    if (name.length() >= 1 && name.length() <= 60) {
       playerName = name;
       bleSendStatus("姓名已設定: " + playerName);
+      Serial.print("[BLE] 姓名已更新: ");
+      Serial.println(playerName);
     } else {
       bleSendStatus("錯誤: 姓名須為 1-20 字元");
     }
   }
 };
 
-// ==================== OLED 動畫函數 ====================
-
-// 設定要播放的動畫（支援單次播放模式）
 void setAnimation(AnimationState newState, bool once = false, AnimationState nextState = ANIM_PLAYING) {
   if (targetAnimState != newState || playOnce != once) {
     targetAnimState = newState;
@@ -248,13 +242,13 @@ void setAnimation(AnimationState newState, bool once = false, AnimationState nex
       case ANIM_HAPPY: Serial.print("HAPPY"); break;
       case ANIM_WAITING: Serial.print("WAITING"); break;
       case ANIM_SAD: Serial.print("SAD"); break;
+      case ANIM_WELCOME: Serial.print("WELCOME"); break;
     }
     if (once) Serial.println(" (單次播放)");
     else Serial.println(" (循環播放)");
   }
 }
 
-// 初始化新動畫
 void initAnimation() {
   currentAnimState = targetAnimState;
   currentFrame = 0;
@@ -279,6 +273,10 @@ void initAnimation() {
       currentGIF = &sad_gif;
       Serial.println("[OLED] ✓ 載入 SAD 動畫");
       break;
+    case ANIM_WELCOME:
+      currentGIF = &welcome_gif;
+      Serial.println("[OLED] ✓ 載入 WELCOME 動畫");
+      break;
     case ANIM_PLAYING:
       currentGIF = nullptr;
       display.clearDisplay();
@@ -288,14 +286,13 @@ void initAnimation() {
   }
 }
 
-// 更新 OLED 動畫（非阻塞）
 void updateOLEDAnimation() {
   if (animationChanged) initAnimation();
 
   if (currentGIF == nullptr || currentAnimState == ANIM_PLAYING) return;
 
   if (playOnce && animationFinished) {
-    Serial.println("[OLED] ✓ 單次動畫播放完成，返回遊戲狀態");
+    Serial.println("[OLED] ✓ 單次動畫播放完成");
     setAnimation(returnState, false);
     return;
   }
@@ -306,7 +303,6 @@ void updateOLEDAnimation() {
   if (now - lastFrameTime >= frameDelay) {
     display.clearDisplay();
 
-    // 繪製當前幀
     for (uint16_t y = 0; y < currentGIF->height; y++) {
       for (uint16_t x = 0; x < currentGIF->width; x++) {
         uint16_t byteIndex = (y * currentGIF->width + x) / 8;
@@ -333,29 +329,6 @@ void updateOLEDAnimation() {
   }
 }
 
-// ==================== OLED2：分數顯示 ====================
-void updateScoreOLED2() {
-  if (!oled2_ok) return;
-
-  display2.clearDisplay();
-  display2.setTextColor(SSD1306_WHITE);
-
-  display2.setTextSize(1);
-  display2.setCursor(0, 0);
-  display2.print("Player:");
-  display2.setCursor(0, 12);
-  display2.print(playerName);
-
-  display2.setTextSize(2);
-  display2.setCursor(0, 28);
-  display2.print("Score:");
-  display2.setCursor(0, 46);
-  display2.print(gameScore);
-
-  display2.display();
-}
-
-// ==================== WiFi & MQTT 函數 ====================
 void setup_wifi() {
   delay(10);
   Serial.println();
@@ -381,6 +354,8 @@ void setup_wifi() {
     Serial.print("[WiFi] 訊號強度: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
+    
+    setAnimation(ANIM_WELCOME, true, ANIM_START);
   } else {
     Serial.println();
     Serial.println("[WiFi] ✗ WiFi 連接失敗！");
@@ -388,7 +363,6 @@ void setup_wifi() {
   Serial.println("========================================");
 }
 
-// 空 callback（保留 setCallback 用，不訂閱任何 topic）
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   (void)topic;
   (void)payload;
@@ -404,7 +378,7 @@ void reconnectMQTT() {
     Serial.println("/3)...");
 
     if (mqttClient.connect(mqtt_client_id)) {
-      Serial.println("[MQTT] ✓ MQTT 連接成功（僅發佈 Tetris/Score）");
+      Serial.println("[MQTT] ✓ MQTT 連接成功");
       Serial.println("[MQTT] ----------------------------------------");
       return;
     } else {
@@ -420,15 +394,20 @@ void reconnectMQTT() {
   }
 
   if (!mqttClient.connected()) {
-    Serial.println("[MQTT] ✗ 無法連接 MQTT，將在背景繼續嘗試...");
+    Serial.println("[MQTT] ✗ 無法連接 MQTT");
   }
   Serial.println("[MQTT] ----------------------------------------");
 }
 
-// 取代原本 publishFraction：不走 MQTT，只更新 OLED2
-void publishFraction(int linesCleared) {
-  (void)linesCleared;
-  updateScoreOLED2();
+void checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    unsigned long now = millis();
+    if (now - lastWifiCheck > wifiCheckInterval) {
+      Serial.println("[WiFi] ⚠ 斷線，嘗試重連...");
+      WiFi.reconnect();
+      lastWifiCheck = now;
+    }
+  }
 }
 
 void publishScore() {
@@ -454,7 +433,6 @@ void publishScore() {
   }
 }
 
-// ==================== 遊戲函數 ====================
 void clearAll() {
   mx.clear();
 }
@@ -522,14 +500,9 @@ void gameOverSequence() {
   gameStarted = false;
 
   setAnimation(ANIM_SAD, true, ANIM_START);
-
-  // BLE 狀態
   bleSendStatus(String("遊戲結束，分數: ") + gameScore);
-
-  // MQTT 上傳最終成績
   publishScore();
 
-  // 閃爍動畫
   for (int i = 0; i < 3; i++) {
     clearAll();
     delay(500);
@@ -539,7 +512,6 @@ void gameOverSequence() {
     delay(500);
   }
 
-  // 顯示 "GAME"
   const char* w1 = "GAME";
   for (int seg = 0; seg < 4; seg++) {
     const uint8_t* pat = letterPattern(w1[seg]);
@@ -560,7 +532,6 @@ void gameOverSequence() {
   }
   delay(1000);
 
-  // 顯示 "OVER"
   const char* w2 = "OVER";
   for (int seg = 0; seg < 4; seg++) {
     const uint8_t* pat = letterPattern(w2[seg]);
@@ -647,6 +618,7 @@ void resetGame() {
   gamePaused = false;
   gameOver = false;
   gameStarted = true;
+  lastScoreUpdate = millis();
 
   setAnimation(ANIM_PLAYING, false);
 
@@ -654,7 +626,7 @@ void resetGame() {
   lastDrop = millis();
   lastRefresh = millis();
 
-  publishFraction(0);
+  sendScoreToBLE();
   bleSendStatus(playerName + " 開始新遊戲");
 }
 
@@ -723,7 +695,7 @@ void placeBlock() {
     Serial.print(" 行！目前分數: ");
     Serial.println(gameScore);
 
-    publishFraction(linesCleared);
+    sendScoreToBLE();
     setAnimation(ANIM_HAPPY, true, ANIM_PLAYING);
   }
 }
@@ -755,59 +727,50 @@ void rotateBlock() {
   }
 }
 
-// ==================== setup() ====================
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
   Serial.println("\n\n");
   Serial.println("╔════════════════════════════════════════╗");
-  Serial.println("║   ESP32 俄羅斯方塊遊戲 (BLE + MQTT)   ║");
-  Serial.println("║   - BLE 控制/姓名/狀態               ║");
+  Serial.println("║   ESP32 俄羅斯方塊 (ESP32核心BLE版)   ║");
+  Serial.println("║   - BLE 控制/姓名/即時分數           ║");
   Serial.println("║   - MQTT 只上傳 Tetris/Score         ║");
+  Serial.println("║   - OLED 動畫（已移除 OLED2）        ║");
   Serial.println("╚════════════════════════════════════════╝");
+
+  printMemoryInfo();
 
   randomSeed(analogRead(0));
 
-  // I2C init
   Wire.begin(SDA_PIN, SCL_PIN);
+  Serial.print("[I2C] 初始化 I2C (SDA:");
+  Serial.print(SDA_PIN);
+  Serial.print(", SCL:");
+  Serial.print(SCL_PIN);
+  Serial.println(")");
 
-  // OLED1：動畫
   Serial.println("[OLED] 初始化 OLED1（動畫）...");
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("[OLED] ✗ OLED1 初始化失敗！");
   } else {
-    Serial.println("[OLED] ✓ OLED1 初始化成功");
+    Serial.println("[OLED] ✓ OLED1 初始化成功 (0x3C)");
     display.clearDisplay();
     display.display();
-    setAnimation(ANIM_START, false);
-    Serial.println("[OLED] 🎬 START 動畫（循環）");
   }
 
-  // OLED2：分數（可選）
-  Serial.println("[OLED2] 初始化 OLED2（分數）...");
-  if (display2.begin(SSD1306_SWITCHCAPVCC, OLED2_ADDR)) {
-    oled2_ok = true;
-    display2.clearDisplay();
-    display2.display();
-    Serial.println("[OLED2] ✓ OLED2 初始化成功");
-  } else {
-    Serial.println("[OLED2] ✗ OLED2 初始化失敗（若你有第二塊 OLED，請確認 I2C 位址）");
-  }
-
-  // MAX7219
   Serial.println("[Display] 初始化 LED 矩陣...");
   mx.begin();
   mx.control(MD_MAX72XX::INTENSITY, MAX_INTENSITY / 2);
   mx.clear();
+  Serial.println("[Display] ✓ MAX7219 初始化成功");
 
   for (int m = 0; m < NUM_MODULES; m++) {
     for (int r = 0; r < SCREEN_W; r++)
       prevBuf[m][r] = 0;
   }
 
-  // BLE init
-  Serial.println("[BLE] 初始化 BLE...");
+  Serial.println("[BLE] 初始化 BLE (ESP32 Core)...");
   BLEDevice::init("Tetris-ESP32");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -834,13 +797,12 @@ void setup() {
 
   pService->start();
   BLEDevice::startAdvertising();
-  Serial.println("[BLE] ✓ BLE 已啟動，等待 App 連線");
+  Serial.println("[BLE] ✓ BLE 已啟動（Tetris-ESP32）");
+  Serial.println("[BLE] ✓ Service UUID: " BLE_SERVICE_UUID);
 
-  // WiFi
   setup_wifi();
 
-  // MQTT
-  Serial.println("[MQTT] 初始化 MQTT（只發佈 Score）...");
+  Serial.println("[MQTT] 初始化 MQTT...");
   mqttClient.setBufferSize(512);
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
@@ -851,23 +813,38 @@ void setup() {
     reconnectMQTT();
   }
 
-  // 初始刷新 OLED2
-  publishFraction(0);
+  printMemoryInfo();
 
   Serial.println("[System] ✓ 初始化完成！");
-  Serial.println("[Game] 💡 透過 BLE 發送 'start' 或 'reset' 指令開始遊戲");
+  Serial.println("╔════════════════════════════════════════╗");
+  Serial.println("║  BLE 指令列表:                        ║");
+  Serial.println("║  - start/reset: 開始新遊戲            ║");
+  Serial.println("║  - left/right: 左右移動               ║");
+  Serial.println("║  - down: 向下移動                     ║");
+  Serial.println("║  - rotate: 旋轉方塊                   ║");
+  Serial.println("║  - superdown: 快速下降                ║");
+  Serial.println("║  - pause: 暫停/繼續                   ║");
+  Serial.println("║                                        ║");
+  Serial.println("║  即時分數透過 BLE 傳送給 APP！        ║");
+  Serial.println("╚════════════════════════════════════════╝");
 }
 
-// ==================== loop() ====================
 void loop() {
-  // 1) OLED 動畫（最優先）
   updateOLEDAnimation();
 
-  // 2) MQTT 連線維護（只為了能上傳 Score）
+  unsigned long now = millis();
+  if (gameStarted && !gamePaused && !gameOver) {
+    if (now - lastScoreUpdate >= SCORE_UPDATE_INTERVAL) {
+      lastScoreUpdate = now;
+      sendScoreToBLE();
+    }
+  }
+
+  checkWiFiConnection();
+
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       static unsigned long lastReconnectAttempt = 0;
-      unsigned long now = millis();
       if (now - lastReconnectAttempt > 10000) {
         lastReconnectAttempt = now;
         Serial.println("[MQTT] ⚠ 連線中斷，嘗試重新連接...");
@@ -878,7 +855,6 @@ void loop() {
     }
   }
 
-  // 3) 處理 BLE 指令（沿用原本 newCommand/mqttCommand 流程）
   if (newCommand) {
     newCommand = false;
     mqttCommand.trim();
@@ -906,7 +882,6 @@ void loop() {
             for (int r = 0; r < SCREEN_W; r++)
               prevBuf[m][r] = 0;
           writeBuffer();
-
           setAnimation(ANIM_PLAYING, false);
           bleSendStatus("遊戲繼續");
         }
@@ -936,20 +911,17 @@ void loop() {
         rotateBlock();
       }
       else if (mqttCommand == "superdown") {
-        Serial.println("[Input] ⚡ SUPERDOWN 啟動！加速下降中...");
+        Serial.println("[Input] ⚡ SUPERDOWN 啟動！");
         int steps = 0;
-
         while (!checkCollision(current.x, current.y + 1)) {
           current.y++;
           steps++;
           writeBuffer();
           delay(30);
         }
-
         Serial.print("[Input] ⚡ SuperDown 完成！下降了 ");
         Serial.print(steps);
         Serial.println(" 格");
-
         lastDrop = millis();
         bleSendStatus(String("SuperDown 下降 ") + steps + " 格");
       }
@@ -961,14 +933,10 @@ void loop() {
     }
   }
 
-  // 4) 遊戲結束/暫停/未開始 -> 不跑遊戲邏輯
   if (gameOver || gamePaused || !gameStarted) {
     return;
   }
 
-  unsigned long now = millis();
-
-  // 自動下落
   if (now - lastDrop > dropInterval) {
     lastDrop = now;
     if (!checkCollision(current.x, current.y + 1)) {
@@ -991,7 +959,6 @@ void loop() {
     }
   }
 
-  // 刷新顯示
   if (now - lastRefresh >= refreshInterval) {
     writeBuffer();
     lastRefresh = now;
